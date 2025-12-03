@@ -57,32 +57,32 @@ int main(int argc, char **argv)
     int client1_fd = accept(server_fd, (struct sockaddr *)&client_addr, &client_addrlen);
     if (client1_fd < 0)
     {
-        perror("connect");
+        perror("connect client2");
         exit(1);
     }
-    printf("Client connected\n");
+    printf("Client1 connected\n");
     Player* player1 = malloc(sizeof(Player));
     Message* m = readLine(client1_fd);
-    if(m != NULL){
+    if(m != NULL && strcmp(m->type, "OPEN") == 0){
         player1->fd = client1_fd;
         strcpy(player1->name, m->fields[0]);
-        send(player1->fd, "0|05|WAIT", 11, 0);
+        send(player1->fd, "0|05|WAIT|", 11, 0);
         puts(player1->name);
     }
 
     int client2_fd = accept(server_fd, (struct sockaddr *)&client_addr, &client_addrlen);
     if (client2_fd < 0)
     {
-        perror("connect");
+        perror("connect client2");
         exit(1);
     }
-    printf("Client connected\n");
+    printf("Client2 connected\n");
     Player* player2 = malloc(sizeof(Player));
     Message* m2 = readLine(client2_fd);
-    if(m2 != NULL){
+    if(m2 != NULL && strcmp(m2->type, "OPEN") == 0){
         player2->fd = client2_fd;
         strcpy(player2->name, m2->fields[0]);
-        send(player2->fd, "0|05|WAIT", 11, 0);
+        send(player2->fd, "0|05|WAIT|", 11, 0);
         puts(player2->name);
     }
 
