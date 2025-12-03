@@ -4,9 +4,10 @@
 #include <sys/socket.h>
 #include <netdb.h>
 #include <string.h>
+#include <poll.h>
 #include "utils.c"
 
-#define MESSAGE_LEN_MAX 104
+
 
 int main(int argc, char **argv)
 {
@@ -53,58 +54,41 @@ int main(int argc, char **argv)
     socklen_t client_addrlen = sizeof(client_addr);
     memset(&client_addr, 0, sizeof(client_addr));
 
-    int client_fd = accept(server_fd, (struct sockaddr *)&client_addr, &client_addrlen);
-    if (client_fd < 0)
+    int client1_fd = accept(server_fd, (struct sockaddr *)&client_addr, &client_addrlen);
+    if (client1_fd < 0)
     {
         perror("connect");
         exit(1);
     }
     printf("Client connected\n");
-
-    char buf[MESSAGE_LEN_MAX + 1];
-    char inbox[8192];
-    int boxlen = 0;
-    while (1)
-    {
-        int bytes = read(client_fd, buf, MESSAGE_LEN_MAX);
-        if (bytes == 0)
-        {
-            fprintf(stderr, "Disconnected\n");
-            break;
-        }
-        if (bytes < 0)
-        {
-            perror("read");
-            break;
-        }
-        buf[bytes] = '\0';
-
-        memcpy(inbox + boxlen, buf, bytes);
-        boxlen += bytes;
-
-        int n;
-        while (boxlen > 0)
-        {
-            n = extract_message(inbox, boxlen);
-            if (n > 0)
-            {
-                char message[n + 1];
-                memmove(message, inbox, n);
-                message[n] = '\0';
-                memmove(inbox, inbox + n, boxlen - n);
-                boxlen -= n;
-                inbox[boxlen] = '\0';
-                printf("Message: %s\n", message);
-            }
-            else{
-                break;
-            }
-        }
-        // printf("%d\n", n);
+    Player* player1 = malloc(sizeof(Player));
+    Message* m = readLine(client1_fd);
+    if(m != NULL){
+        player1->fd = client1_fd;
+        strcpy(player1->name, m->fields[0]);
+        send(player1->fd, "0|05|WAIT", 11, 0);
+        puts(player1->name);
     }
 
+    int client2_fd = accept(server_fd, (struct sockaddr *)&client_addr, &client_addrlen);
+    if (client2_fd < 0)
+    {
+        perror("connect");
+        exit(1);
+    }
+    printf("Client connected\n");
+    Player* player2 = malloc(sizeof(Player));
+    Message* m2 = readLine(client2_fd);
+    if(m2 != NULL){
+        player2->fd = client2_fd;
+        strcpy(player2->name, m2->fields[0]);
+        send(player2->fd, "0|05|WAIT", 11, 0);
+        puts(player2->name);
+    }
+
+
     close(server_fd);
-    close(client_fd);
+    close(client1_fd);
 
     return 0;
 }
