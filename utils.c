@@ -5,21 +5,28 @@ typedef struct
     char type[5];
     char **fields;
     int fieldCount;
+
 } Message;
 
 typedef struct
 {
     int fd;
     char name[73];
+    int ready;
+    int turn;
+    int order;
+    char board[10];
 } Player;
 
 #define MESSAGE_LEN_MAX 104
 
 int convertString(char *num);
+int boardEmpty(char* board);
+void applyMove(int pile, int amount, char *board);
 
 Message *parse(char *raw, int bytes)
 {
-  
+
     int maxFields = 0;
     for (int i = 0; i < bytes; ++i)
     {
@@ -153,6 +160,100 @@ void destroyMessage(Message *m)
     free(m);
 }
 
-void initGame()
+Player *createPLayer(int fd)
 {
+    Player *player = malloc(sizeof(Player));
+    Message *m = readLine(fd);
+    if (m != NULL && strcmp(m->type, "OPEN") == 0)
+    {
+        player->fd = fd;
+        strcpy(player->name, m->fields[0]);
+        send(player->fd, "0|05|WAIT|\n", 11, 0);
+        player->ready = 1;
+        char *board = "1 3 5 7 9";
+        strncpy(player->board, board, 10);
+        destroyMessage(m);
+        return player;
+    }
+    destroyMessage(m);
+    return NULL;
+}
+void handleMessage(Player *p1, Player *p2, Message *m)
+{
+    if (strcmp(m->type, "MOVE") == 0)
+    {
+        int pile = convertString(m->fields[0]);
+        int amount = convertString(m->fields[1]);
+
+        if (!p1->turn)
+        {
+            char *err = "31 Impatient";
+            exit(1);
+        }
+
+        applyMove(pile, amount, p2->board);
+        if (boardEmpty(p2->board))
+        {
+            char*message = malloc(23);
+            snprintf(message, 33, "0|18|OVER|%d|%s||\n", p2->order, p2->board);
+            send(p2->fd, message, strlen(message), 0);
+            send(p1->fd, message, strlen(message), 0);
+            free(message);
+
+            exit(1);
+        }
+        else{
+            char* message = malloc(22);
+            snprintf(message, 33, "0|17|PLAY|%d|%s|\n", p1->order, p1->board);
+            send(p2->fd, message, strlen(message), 0);
+            free(message);
+        }
+        p1->turn = 0;
+        p2->turn = 1;
+    }
+}
+
+void applyMove(int pile, int amount, char *board)
+{
+
+    if (pile > 5)
+    {
+        char *err = "31 Pile Index";
+    }
+    if (amount > 9)
+    {
+        char *err = "33 Quanity";
+    }
+
+    int idx = pile * 2 - 2;
+        if(boardEmpty(board) || board[idx] == '0'){
+        return;
+    }
+    char *num = malloc(2);
+    if(board[idx] <= '0'){
+        return;
+    }
+    sprintf(num, "%c", board[idx]);
+    int newAmt = amount - convertString(num);
+    if (newAmt <= 0)
+    {
+        board[idx] = '0';
+    }
+    else
+    {
+        board[idx] = (char)newAmt;
+    }
+    return;
+}
+
+int boardEmpty(char *board)
+{
+    for (int i = 0; i < 9; i += 2)
+    {
+        if (board[i] != '0')
+        {
+            return 0;
+        }
+    }
+    return 1;
 }
