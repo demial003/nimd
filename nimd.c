@@ -5,7 +5,15 @@
 #include <netdb.h>
 #include <string.h>
 #include <poll.h>
+#include <pthread.h>
 #include "utils.c"
+
+typedef struct
+{
+    Player *p1;
+    Player *p2;
+} Game;
+void *gameThread(void *arg);
 
 int main(int argc, char **argv)
 {
@@ -52,64 +60,111 @@ int main(int argc, char **argv)
     socklen_t client_addrlen = sizeof(client_addr);
     memset(&client_addr, 0, sizeof(client_addr));
 
-    int client1_fd = accept(server_fd, (struct sockaddr *)&client_addr, &client_addrlen);
-    if (client1_fd < 0)
+    Player *waiting = NULL;
+    for (;;)
     {
-        perror("connect client2");
-        exit(1);
-    }
-    printf("Client1 connected\n");
-    Player *player1 = createPLayer(client1_fd);
-    if (player1 == NULL)
-    {
-        fprintf(stderr, "failed to create player");
-        exit(1);
-    }
-    player1->turn = 1;
-    player1->order = 1;
+        int client_fd = accept(server_fd, (struct sockaddr *)&client_addr, &client_addrlen);
+        if (client_fd < 0)
+        {
+            if (errno == EINTR)
+                continue;
+            perror("accept");
+            break;
+        }
+        // create player and run OPEN handshake (createPLayer does that)
+        Player *p = createPLayer(client_fd);
+        if (!p)
+        {
+            close(client_fd);
+            continue;
+        }
 
-    int client2_fd = accept(server_fd, (struct sockaddr *)&client_addr, &client_addrlen);
-    if (client2_fd < 0)
-    {
-        perror("connect client2");
-        exit(1);
-    }
-    printf("Client2 connected\n");
-    Player *player2 = createPLayer(client2_fd);
-    if (player2 == NULL)
-    {
-        fprintf(stderr, "failed to create player");
-        exit(1);
-    }
-    player2->order = 2;
+        if (!waiting)
+        {
+            waiting = p;
+        }
+        else
+        {
 
-    if (player1->ready && player2->ready)
-    {
-        int messageLen1 = 8 + strlen(player2->name);
-        int messageLen2 = 8 + strlen(player1->name);
-        int totalLen1 = 7 + messageLen1;
-        int totalLen2 = 7 + messageLen2;
-        char *message1 = malloc(totalLen1);
-        snprintf(message1, totalLen1, "0|%d|NAME|1|%s|\n", messageLen1, player2->name);
-        char *message2 = malloc(totalLen2);
-        snprintf(message2, totalLen2, "0|%d|NAME|2|%s|\n", messageLen2, player1->name);
-        send(player2->fd, message1, totalLen1, 0);
+            Game *g = malloc(sizeof(Game));
+            g->p1 = waiting;
+            g->p2 = p;
+            waiting = NULL;
 
-        send(player1->fd, message2, totalLen2, 0);
-        char *message3 = malloc(22);
-        snprintf(message3, 33, "0|17|PLAY|%d|%s|\n", player2->order, player2->board);
-        send(player1->fd, message3, strlen(message3), 0);
-        free(message1);
-        free(message2);
-        free(message3);
+            if (g->p1->inGame)
+            {
+                sendFail(g->p1->fd, 22, "Already playing", 1);
+
+                free(g->p2);
+                free(g);
+                continue;
+            }
+            if (g->p2->inGame)
+            {
+                sendFail(g->p2->fd, 22, "Already playing", 1);
+                free(g->p1);
+                free(g);
+                continue;
+            }
+
+            g->p1->inGame = 1;
+            g->p2->inGame = 1;
+
+            pthread_t tid;
+            if (pthread_create(&tid, NULL, gameThread, g) != 0)
+            {
+                perror("pthread_create");
+                close(g->p1->fd);
+                close(g->p2->fd);
+                free(g->p1);
+                free(g->p2);
+                free(g);
+                continue;
+            }
+            pthread_detach(tid);
+        }
     }
+}
 
+void *gameThread(void *arg)
+{
+    Game *g = (Game *)arg;
+    Player *player1 = g->p1;
+    Player *player2 = g->p2;
 
     struct pollfd fds[2];
     fds[0].fd = player1->fd;
     fds[0].events = POLLIN;
     fds[1].fd = player2->fd;
     fds[1].events = POLLIN;
+
+    player1->turn = 1;
+    player1->order = 1;
+    player1->ready = 1;
+
+    player2->turn = 0;
+    player2->order = 2;
+    player2->ready = 1;
+
+    char nameBody1[128];
+    snprintf(nameBody1, sizeof(nameBody1), "NAME|1|%s|", player2->name);
+    char *nameMsg1 = build_message(nameBody1);
+    send(player1->fd, nameMsg1, strlen(nameMsg1), 0);
+    free(nameMsg1);
+
+    char nameBody2[128];
+    snprintf(nameBody2, sizeof(nameBody2), "NAME|2|%s|", player1->name);
+    char *nameMsg2 = build_message(nameBody2);
+    send(player2->fd, nameMsg2, strlen(nameMsg2), 0);
+    free(nameMsg2);
+
+    char playBody[128];
+    snprintf(playBody, sizeof(playBody), "PLAY|1|%s|", player1->board);
+
+    char *playMsg = build_message(playBody);
+    send(player1->fd, playMsg, strlen(playMsg), 0);
+    send(player2->fd, playMsg, strlen(playMsg), 0);
+    free(playMsg);
 
     while (1)
     {
@@ -122,10 +177,10 @@ int main(int argc, char **argv)
 
         if (fds[0].revents & POLLIN)
         {
-            Message *m = readLine(player1->fd);
+            Message *m = readLine(player1);
             if (m == NULL)
             {
-                fprintf(stderr, "Client1 Disconnected\n");
+                sendFail(player1->fd, 10, "Invalid Message", 1);
                 break;
             }
             handleMessage(player1, player2, m);
@@ -134,10 +189,10 @@ int main(int argc, char **argv)
 
         if (fds[1].revents & POLLIN)
         {
-            Message *m = readLine(player2->fd);
+            Message *m = readLine(player2);
             if (m == NULL)
             {
-                fprintf(stderr, "Client1 Disconnected\n");
+                sendFail(player2->fd, 10, "Invalid Message", 1);
                 break;
             }
             handleMessage(player2, player1, m);
@@ -145,11 +200,11 @@ int main(int argc, char **argv)
         }
     }
 
-    close(server_fd);
-    close(client1_fd);
-    close(client2_fd);
+    close(player1->fd);
+    close(player2->fd);
     free(player1);
     free(player2);
-
-    return 0;
+    free(g);
+    pthread_exit(NULL);
+    return NULL;
 }

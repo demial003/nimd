@@ -1,3 +1,4 @@
+#include <errno.h>
 typedef struct
 {
     int version;
@@ -13,16 +14,21 @@ typedef struct
     int fd;
     char name[73];
     int ready;
+    int inGame;
     int turn;
     int order;
     char board[10];
+    char inbox[8192];
+    int boxlen;
 } Player;
 
 #define MESSAGE_LEN_MAX 104
 
 int convertString(char *num);
-int boardEmpty(char* board);
+int boardEmpty(char *board);
 void applyMove(int pile, int amount, char *board);
+char *build_message(const char *body);
+void sendFail(int fd, int code, const char *msgText, int closeAfter);
 
 Message *parse(char *raw, int bytes)
 {
@@ -65,6 +71,7 @@ Message *parse(char *raw, int bytes)
         return NULL;
     }
     strncpy(m->type, tokens[2], 5);
+    m->type[4] = '\0';
 
     int rem = tokenCount - 3;
     m->fieldCount = rem;
@@ -82,13 +89,19 @@ int extract_message(char *inbox, int len)
     if (len < 5)
         return -1;
 
+    if (inbox[0] != '0' || inbox[1] != '|')
+        return -1;
+
     char seg[3];
     seg[0] = inbox[2];
     seg[1] = inbox[3];
     seg[2] = '\0';
     int msglen = convertString(seg);
+    if (msglen < 0)
+        return -1;
+
     int total = 5 + msglen;
-    if (len >= total)
+    if (len >= total && inbox[total - 1] == '|')
     {
         return total;
     }
@@ -101,11 +114,10 @@ int convertString(char *num)
     return (int)strtol(num, &endptr, 10);
 }
 
-Message *readLine(int client_fd)
+Message *readLine(Player *player)
 {
     char buf[MESSAGE_LEN_MAX + 1];
-    char inbox[8192];
-    int boxlen = 0;
+    int client_fd = player->fd;
     while (1)
     {
 
@@ -115,21 +127,28 @@ Message *readLine(int client_fd)
         {
             return NULL;
         }
-
-        memcpy(inbox + boxlen, buf, bytes);
-        boxlen += bytes;
-        int n;
-        while (boxlen > 0)
+        if (bytes < 0)
         {
-            n = extract_message(inbox, boxlen);
+            if (errno == EINTR)
+                continue;
+            perror("read");
+            return NULL;
+        }
+
+        memcpy(player->inbox + player->boxlen, buf, bytes);
+        player->boxlen += bytes;
+        int n;
+        while (player->boxlen > 0)
+        {
+            n = extract_message(player->inbox, player->boxlen);
             if (n > 0)
             {
                 char message[n + 1];
-                memmove(message, inbox, n);
+                memmove(message, player->inbox, n);
                 message[n] = '\0';
-                memmove(inbox, inbox + n, boxlen - n);
-                boxlen -= n;
-                inbox[boxlen] = '\0';
+                memmove(player->inbox, player->inbox + n, player->boxlen - n);
+                player->boxlen -= n;
+                player->inbox[player->boxlen] = '\0';
                 Message *m = parse(message, n);
                 return m;
             }
@@ -163,12 +182,27 @@ void destroyMessage(Message *m)
 Player *createPLayer(int fd)
 {
     Player *player = malloc(sizeof(Player));
-    Message *m = readLine(fd);
+    memset(player, 0, sizeof(Player));
+    player->fd = fd;
+    player->boxlen = 0;
+    Message *m = readLine(player);
+    if (strlen(m->fields[0]) > 72)
+    {
+        sendFail(fd, 21, "Long Name", 1);
+        destroyMessage(m);
+        free(player);
+        return NULL;
+    }
     if (m != NULL && strcmp(m->type, "OPEN") == 0)
     {
-        player->fd = fd;
         strcpy(player->name, m->fields[0]);
-        send(player->fd, "0|05|WAIT|\n", 11, 0);
+        char *waitmsg = build_message("WAIT|");
+        if (waitmsg)
+        {
+            send(player->fd, waitmsg, strlen(waitmsg), 0);
+            free(waitmsg);
+        }
+
         player->ready = 1;
         char *board = "1 3 5 7 9";
         strncpy(player->board, board, 10);
@@ -180,70 +214,94 @@ Player *createPLayer(int fd)
 }
 void handleMessage(Player *p1, Player *p2, Message *m)
 {
+    if (strcmp(m->type, "OPEN") == 0 && p1->ready)
+    {
+        sendFail(p1->fd, 23, "Already Open", 1);
+        return;
+    }
+
+    if (strcmp(m->type, "MOVE") == 0 && !p1->ready)
+    {
+        sendFail(p1->fd, 24, "Not Playing", 1);
+        return;
+    }
+
     if (strcmp(m->type, "MOVE") == 0)
     {
         int pile = convertString(m->fields[0]);
         int amount = convertString(m->fields[1]);
 
+        if (pile < 1 || pile > 5)
+        {
+            sendFail(p1->fd, 32, "Pile Index", 0);
+            return;
+        }
+        if (amount < 1 || amount > 9)
+        {
+            sendFail(p1->fd, 33, "Quantity", 0);
+            return;
+        }
+
         if (!p1->turn)
         {
-            char *err = "31 Impatient";
-            exit(1);
+            sendFail(p1->fd, 31, "Impatient", 0);
+            return;
         }
 
         applyMove(pile, amount, p2->board);
-        if (boardEmpty(p2->board))
-        {
-            char*message = malloc(23);
-            snprintf(message, 33, "0|18|OVER|%d|%s||\n", p2->order, p2->board);
-            send(p2->fd, message, strlen(message), 0);
-            send(p1->fd, message, strlen(message), 0);
-            free(message);
-
-            exit(1);
-        }
-        else{
-            char* message = malloc(22);
-            snprintf(message, 33, "0|17|PLAY|%d|%s|\n", p1->order, p1->board);
-            send(p2->fd, message, strlen(message), 0);
-            free(message);
-        }
-        p1->turn = 0;
-        p2->turn = 1;
+        strcpy(p1->board, p2->board);
     }
+
+    if (boardEmpty(p2->board))
+    {
+        char body[64];
+        snprintf(body, sizeof(body), "OVER|%d|%s||", p1->order, p2->board);
+        char *message = build_message(body);
+        send(p2->fd, message, strlen(message), 0);
+        send(p1->fd, message, strlen(message), 0);
+        free(message);
+
+        close(p1->fd);
+        close(p2->fd);
+        return;
+    }
+    else
+    {
+        char body1[64];
+        char body2[64];
+
+        snprintf(body1, sizeof(body1), "PLAY|%d|%s|", p2->order, p2->board);
+        snprintf(body2, sizeof(body2), "PLAY|%d|%s|", p2->order, p2->board);
+        char *message1 = build_message(body1);
+        char *message2 = build_message(body2);
+        send(p2->fd, message1, strlen(message1), 0);
+        send(p1->fd, message2, strlen(message2), 0);
+        free(message1);
+        free(message2);
+    }
+    p1->turn = 0;
+    p2->turn = 1;
 }
 
 void applyMove(int pile, int amount, char *board)
 {
 
-    if (pile > 5)
+    int idx = (pile - 1) * 2;
+    if (boardEmpty(board) || board[idx] == '0')
     {
-        char *err = "31 Pile Index";
-    }
-    if (amount > 9)
-    {
-        char *err = "33 Quanity";
+        return;
     }
 
-    int idx = pile * 2 - 2;
-        if(boardEmpty(board) || board[idx] == '0'){
-        return;
-    }
-    char *num = malloc(2);
-    if(board[idx] <= '0'){
-        return;
-    }
-    sprintf(num, "%c", board[idx]);
-    int newAmt = amount - convertString(num);
+    int cur = board[idx] - '0';
+    int newAmt = cur - amount;
     if (newAmt <= 0)
     {
         board[idx] = '0';
     }
     else
     {
-        board[idx] = (char)newAmt;
+        board[idx] = '0' + newAmt;
     }
-    return;
 }
 
 int boardEmpty(char *board)
@@ -256,4 +314,37 @@ int boardEmpty(char *board)
         }
     }
     return 1;
+}
+
+char *build_message(const char *body)
+{
+    int body_len = strlen(body);
+    if (body_len > 104)
+        return NULL;
+    char header[16];
+    snprintf(header, sizeof(header), "0|%02d|", body_len);
+    int total = strlen(header) + body_len;
+    char *msg = malloc(total + 1);
+    if (!msg)
+        return NULL;
+    memcpy(msg, header, strlen(header));
+    memcpy(msg + strlen(header), body, body_len);
+    msg[total] = '\0';
+    return msg;
+}
+
+void sendFail(int fd, int code, const char *msgText, int closeAfter)
+{
+    char body[128];
+    snprintf(body, sizeof(body), "FAIL|%d %s|", code, msgText ? msgText : "");
+    char *msg = build_message(body);
+    if (msg)
+    {
+        send(fd, msg, strlen(msg), 0);
+        free(msg);
+    }
+    if (closeAfter)
+    {
+        close(fd);
+    }
 }
